@@ -1,0 +1,200 @@
+# Arquitetura de Software: Sistema de Consulta Jurídica com RAG e IA (AWS)
+
+## 1. Visão Geral Executiva
+Esta arquitetura descreve uma aplicação web baseada em **Streamlit** para consulta de documentos trabalhistas utilizando **Retrieval-Augmented Generation (RAG)**. O sistema é projetado para ser implantado na **AWS**, priorizando serviços gerenciados (Serverless/PaaS) para otimizar custos, facilitar a escalabilidade e garantir segurança.
+
+### Pilares da Arquitetura
+- **Segurança:** Autenticação robusta (OAuth2), criptografia em trânsito e repouso, e conformidade com LGPD.
+- **Escalabilidade:** Uso de containers e serviços serverless que escalam automaticamente com a demanda.
+- **Disponibilidade:** Arquitetura Multi-AZ (Availability Zone).
+- **Custo-Eficiência:** Modelo "Pay-as-you-go" priorizado.
+
+---
+
+## 2. Arquitetura Lógica
+
+O sistema é dividido em três camadas principais:
+1.  **Camada de Apresentação (Frontend):** Interface Streamlit.
+2.  **Camada de Aplicação & Inteligência (Backend/RAG):** Lógica de negócios, orquestração de IA e processamento de documentos.
+3.  **Camada de Dados:** Armazenamento de objetos e vetores.
+
+```mermaid
+graph TD
+    User([Usuário: Advogado/RH]) -->|HTTPS/TLS| WAF[WAF / CloudFront]
+    WAF --> LB[Load Balancer]
+    LB --> App[Streamlit App (Container)]
+    
+    subgraph "Camada de Aplicação"
+        App <-->|Auth| AuthProvider[Identity Provider (Cognito)]
+        App -->|Query| RAGController[Orquestrador RAG (LangChain/LlamaIndex)]
+        RAGController <-->|Retrieve| VectorDB[(Vector DB)]
+        RAGController <-->|Generate| LLM[LLM Service (Bedrock)]
+    end
+
+    subgraph "Camada de Dados"
+        Ingestion[Pipeline de Ingestão] -->|Processa| S3Buck[(S3: Documentos)]
+        Ingestion -->|Embed| EmbeddingModel[Modelo de Embeddings]
+        EmbeddingModel -->|Indexa| VectorDB
+    end
+```
+
+---
+
+## 3. Arquitetura Física (AWS)
+
+Mapeamento dos componentes lógicos para serviços AWS recomendados para um projeto acadêmico/profissional moderno.
+
+| Componente Lógico | Serviço AWS Recomendado | Justificativa |
+| :--- | :--- | :--- |
+| **Frontend/App** | **AWS App Runner** ou **ECS Fargate** | Execução de containers sem gerenciar servidores. App Runner é mais simples para Streamlit (WebSocket nativo). |
+| **Autenticação** | **Amazon Cognito** | Gerenciamento de usuários, OIDC/OAuth2, fácil integração com ALB/App. |
+| **LLM & Embeddings** | **Amazon Bedrock** | Acesso via API a modelos (Claude, Titan) sem gerenciar infraestrutura de GPU. |
+| **Vector DB** | **Amazon OpenSearch Serverless** ou **Knowledge Base for Bedrock** | Escalável e nativo. *Opção econômica:* FAISS local no container ou Pinecone (SaaS externo). |
+| **Armazenamento** | **Amazon S3** | Armazenamento seguro e barato para PDFs e DOCXs. |
+| **Segurança Borda** | **AWS WAF** + **CloudFront** | Proteção contra ataques web e entrega de conteúdo via CDN. |
+| **Segredos** | **AWS Systems Manager Parameter Store** | Gerenciamento de chaves e credenciais seguro e baixo custo (vs Secrets Manager). |
+
+---
+
+## 4. Pipeline RAG Detalhado
+
+O coração do sistema é o pipeline RAG.
+
+### 4.1. Ingestão e Processamento (Offline/Batch)
+1.  **Upload:** Administrador sobe arquivos (PDF, DOCX) no Bucket S3 `raw-documents`.
+2.  **Trigger:** Evento S3 aciona uma **AWS Lambda**.
+3.  **Extração de Texto:** Lambda usa *bibliotecas Python* (pypdf, docx2txt) ou **Amazon Textract** (se houver imagens escaneadas) para extrair texto limpo.
+4.  **Chunking:** O texto é dividido em pedaços (chunks).
+    *   *Estratégia:* Chunking semântico ou recursivo (ex: 512 tokens com 10% de overlap). Respeitar parágrafos legais (artigos).
+5.  **Embedding:** Cada chunk é enviado para o modelo de embeddings (ex: *Titan Text Embeddings v2* via Bedrock).
+6.  **Indexação:** O vetor resultante + metadados (Fonte: "CLT Art 3", Página: 5) são salvos no Vector DB.
+
+### 4.2. Recuperação e Geração (Online/Real-time)
+1.  **Query do Usuário:** Recebida no Streamlit.
+2.  **Reformulação (Opcional):** LLM reescreve a pergunta para melhor busca (HyDE - Hypothetical Document Embeddings).
+3.  **Vector Search:** Pergunta é convertida em vetor e busca-se similaridade (Cosine Similarity) no Vector DB. Retorna top-K (ex: 5 a 10) chunks.
+4.  **Re-ranking (Opcional):** Um modelo Cross-Encoder reordena os chunks por relevância para aumentar precisão.
+5.  **Prompt Engineering:**
+    *   Contexto: Chunks recuperados.
+    *   Instrução: "Responda à pergunta baseada APENAS no contexto abaixo. Cite a fonte."
+6.  **Geração:** LLM gera a resposta final.
+7.  **Exibição:** Streamlit mostra resposta + fontes (com links para o documento no S3, se presinado URLs pré-assinadas).
+
+---
+
+## 5. Diagramas de Sequência
+
+### 5.1. Fluxo de Login (Authorization Code Flow)
+```mermaid
+sequenceDiagram
+    participant User
+    participant Browser
+    participant Cognito as AWS Cognito
+    participant App as Streamlit App
+    
+    User->>Browser: Acessa Aplicação
+    Browser->>App: GET /
+    App->>App: Verifica Sessão?
+    alt Não Autenticado
+        App-->>Browser: Redireciona para Cognito (Login UI)
+        Browser->>Cognito: Credenciais
+        Cognito-->>Browser: Auth Code
+        Browser->>App: Callback com Auth Code
+        App->>Cognito: Troca Code por Tokens (ID, Access)
+        Cognito-->>App: Tokens JWT
+        App->>App: Cria Sessão
+    end
+    App-->>Browser: Exibe Dashboard
+```
+
+### 5.2. Fluxo de Consulta RAG
+```mermaid
+sequenceDiagram
+    participant User
+    participant App as Streamlit App
+    participant Embed as Bedrock (Embeddings)
+    participant VectorDB
+    participant LLM as Bedrock (Claude)
+
+    User->>App: Pergunta: "O que define um empregado?"
+    App->>Embed: Gera vetor da pergunta
+    Embed-->>App: Vetor [0.1, 0.5, ...]
+    App->>VectorDB: Busca Similaridade (k=5)
+    VectorDB-->>App: Retorna Chunks + Metadados
+    App->>App: Monta Prompt com Contexto
+    App->>LLM: Envia Prompt
+    LLM-->>App: Resposta Gerada
+    App-->>User: Exibe Resposta + Citações
+```
+
+---
+
+## 6. Segurança e Conformidade (LGPD)
+
+### Proteção de Dados
+1.  **Criptografia:**
+    *   *Em Trânsito:* TLS 1.2+ em todas as comunicações.
+    *   *Em Repouso:* Dados no S3 e Vector DB criptografados com chaves gerenciadas (SSE-S3 ou KMS).
+2.  **Minimização de Dados (LGPD):**
+    *   Não armazenar histórico de chat (conforme requisito).
+    *   Logs apenas técnicos, anonimizando Identificadores de Usuários (PII) nos logs de aplicação.
+3.  **Controle de Acesso:**
+    *   IAM Roles para a aplicação acessar Bedrock/S3 (Princípio do Menor Privilégio).
+    *   Grupos no Cognito para perfis (Advogado, RH). *Nota: O RAG pode filtrar documentos baseados nesses grupos se necessário.*
+
+---
+
+## 7. Estratégia de Deploy (CI/CD)
+
+### Ambientes
+1.  **Desenvolvimento (Dev):** Branch `develop`. Deploy automático após push. Infra menor/mais barata.
+2.  **Produção (Prod):** Branch `main`. Deploy após aprovação manual (Gate).
+
+### Pipeline (GitHub Actions ou AWS CodePipeline)
+1.  **Source:** Checkout do código.
+2.  **Build & Test:**
+    *   Linting (Ruff/Flake8).
+    *   Testes Unitários (Pytest).
+    *   Build da Imagem Docker.
+3.  **Security Scan:** Scan de vulnerabilidades na imagem (Trivy/ECR Scanning).
+4.  **Deploy:**
+    *   Push para Amazon ECR (Elastic Container Registry).
+    *   Atualização do serviço no App Runner/ECS via CloudFormation ou Terraform.
+
+---
+
+## 8. Especificação de Componentes (Stack Recomendada)
+
+### Aplicação (Streamlit)
+*   **Linguagem:** Python 3.10+
+*   **Frameworks:** Streamlit, LangChain (para orquestração), Pydantic (validação).
+*   **Cliente AWS:** Boto3.
+
+### Estrutura de Diretórios Sugerida
+```text
+/
+├── app.py                 # Ponto de entrada Streamlit
+├── src/
+│   ├── auth.py            # Lógica de validação JWT/Cognito
+│   ├── rag_engine.py      # Lógica de retrieval e geração
+│   ├── aws_utils.py       # Clientes Boto3 (S3, Bedrock)
+│   └── ui_components.py   # Widgets reutilizáveis
+├── documents/             # Docs locais (apenas dev)
+├── infra/                 # IaC (Terraform/CloudFormation)
+├── tests/                 # Testes automatizados
+├── requirements.txt
+└── Dockerfile
+```
+
+## 9. Custo Estimado (Cenário "Orçamento Limitado")
+Para manter baixo custo no projeto AWS:
+*   **LLM:** Use **Bedrock** com modelos *Titan* ou *Llama* (mais baratos que Claude) ou pague apenas pelo uso (On-Demand).
+*   **Vector DB:** **FAISS** rodando em memória dentro do container do Streamlit (Custo zero de infra dedicada de banco, ideal para < 100MB de texto). Se precisar escalar, migre para Pinecone (Free Tier) ou OpenSearch.
+*   **Compute:** **App Runner** pausa quando não usado (se configurado) ou use uma instância EC2 t3.micro/small para dev.
+
+---
+**Próximos Passos Sugeridos para o Usuário:**
+1.  Configurar conta AWS e User Pool no Cognito.
+2.  Criar o bucket S3 e subir os documentos de exemplo.
+3.  Desenvolver o script de ingestão (rodar localmente primeiro) para criar o índice FAISS.
+4.  Construir a UI básica em Streamlit conectada ao Bedrock.
